@@ -22,6 +22,7 @@
 #include <folly/SharedMutex.h>
 #include <folly/SpinLock.h>
 #include <folly/ssl/Init.h>
+#include <folly/ssl/OpenSSLTicketHandler.h>
 #include <folly/ssl/SSLSessionManager.h>
 #include <folly/system/ThreadId.h>
 
@@ -101,6 +102,24 @@ void configureProtocolVersion(SSL_CTX* ctx, SSLContext::SSLVersion version) {
   int newOpt = SSL_CTX_set_options(ctx, opt);
   DCHECK((newOpt & opt) == opt);
 #endif // FOLLY_OPENSSL_PREREQ(1, 1, 0)
+}
+
+static int dispatchTicketCrypto(
+    SSL* ssl,
+    unsigned char* keyName,
+    unsigned char* iv,
+    EVP_CIPHER_CTX* cipherCtx,
+    HMAC_CTX* hmacCtx,
+    int encrypt) {
+  auto ctx = folly::SSLContext::getFromSSLCtx(SSL_get_SSL_CTX(ssl));
+  DCHECK(ctx);
+
+  auto handler = ctx->getTicketHandler();
+  if (!handler) {
+    LOG(FATAL) << "Null OpenSSLTicketHandler in callback";
+  }
+
+  return handler->ticketCallback(ssl, keyName, iv, cipherCtx, hmacCtx, encrypt);
 }
 } // namespace
 
@@ -571,7 +590,11 @@ int SSLContext::alpnSelectCallback(
             item.length,
             in,
             inlen) != OPENSSL_NPN_NEGOTIATED) {
-      return SSL_TLSEXT_ERR_NOACK;
+      if (context->getRequireAlpnIfClientSupports()) {
+        return SSL_TLSEXT_ERR_ALERT_FATAL;
+      } else {
+        return SSL_TLSEXT_ERR_NOACK;
+      }
     }
   }
   return SSL_TLSEXT_ERR_OK;
@@ -849,6 +872,14 @@ void SSLContext::setAllowNoDheKex(bool flag) {
   }
 }
 #endif // FOLLY_OPENSSL_PREREQ(1, 1, 1)
+
+void SSLContext::setTicketHandler(
+    std::unique_ptr<OpenSSLTicketHandler> handler) {
+#ifdef SSL_CTRL_SET_TLSEXT_TICKET_KEY_CB
+  ticketHandler_ = std::move(handler);
+  SSL_CTX_set_tlsext_ticket_key_cb(ctx_, dispatchTicketCrypto);
+#endif
+}
 
 std::ostream& operator<<(std::ostream& os, const PasswordCollector& collector) {
   os << collector.describe();

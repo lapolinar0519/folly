@@ -19,11 +19,16 @@
 #include <array>
 #include <memory>
 
+#include <folly/Portability.h>
 #include <folly/concurrency/CacheLocality.h>
 #include <folly/container/Enumerate.h>
 #include <folly/synchronization/Hazptr.h>
 
 namespace folly {
+
+// On mobile we do not expect high concurrency, and memory is more important, so
+// use more conservative caching.
+constexpr size_t kCoreCachedSharedPtrDefaultNumSlots = kIsMobile ? 4 : 64;
 
 /**
  * This class creates core-local caches for a given shared_ptr, to
@@ -35,12 +40,11 @@ namespace folly {
  *
  * @author Giuseppe Ottaviano <ott@fb.com>
  */
-template <class T, size_t kNumSlots = 64>
+template <class T, size_t kNumSlots = kCoreCachedSharedPtrDefaultNumSlots>
 class CoreCachedSharedPtr {
  public:
-  explicit CoreCachedSharedPtr(const std::shared_ptr<T>& p = nullptr) {
-    reset(p);
-  }
+  CoreCachedSharedPtr() = default;
+  explicit CoreCachedSharedPtr(const std::shared_ptr<T>& p) { reset(p); }
 
   void reset(const std::shared_ptr<T>& p = nullptr) {
     // Allocate each Holder in a different CoreRawAllocator stripe to
@@ -66,10 +70,16 @@ class CoreCachedSharedPtr {
   std::array<std::shared_ptr<T>, kNumSlots> slots_;
 };
 
-template <class T, size_t kNumSlots = 64>
+template <class T, size_t kNumSlots = kCoreCachedSharedPtrDefaultNumSlots>
 class CoreCachedWeakPtr {
  public:
+  CoreCachedWeakPtr() = default;
   explicit CoreCachedWeakPtr(const CoreCachedSharedPtr<T, kNumSlots>& p) {
+    reset(p);
+  }
+
+  void reset() { *this = {}; }
+  void reset(const CoreCachedSharedPtr<T, kNumSlots>& p) {
     for (auto slot : folly::enumerate(slots_)) {
       *slot = p.slots_[slot.index];
     }
@@ -77,6 +87,11 @@ class CoreCachedWeakPtr {
 
   std::weak_ptr<T> get() const {
     return slots_[AccessSpreader<>::cachedCurrent(kNumSlots)];
+  }
+
+  // Faster than get().lock(), as it avoid one weak count cycle.
+  std::shared_ptr<T> lock() const {
+    return slots_[AccessSpreader<>::cachedCurrent(kNumSlots)].lock();
   }
 
  private:
@@ -95,7 +110,7 @@ class CoreCachedWeakPtr {
  * get()s will never see a newer pointer on one core, and an older
  * pointer on another after a subsequent thread migration.
  */
-template <class T, size_t kNumSlots = 64>
+template <class T, size_t kNumSlots = kCoreCachedSharedPtrDefaultNumSlots>
 class AtomicCoreCachedSharedPtr {
  public:
   explicit AtomicCoreCachedSharedPtr(const std::shared_ptr<T>& p = nullptr) {
@@ -105,7 +120,7 @@ class AtomicCoreCachedSharedPtr {
   ~AtomicCoreCachedSharedPtr() {
     auto slots = slots_.load(std::memory_order_acquire);
     // Delete of AtomicCoreCachedSharedPtr must be synchronized, no
-    // need for stlots->retire().
+    // need for slots->retire().
     if (slots) {
       delete slots;
     }
